@@ -10,3 +10,4 @@ psutil
 uiautomation
 edge-tts
 pyinstaller
+vosk

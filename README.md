@@ -10,10 +10,12 @@
 
 ## What it does
 
-Press **F9**, say a song - *"play God's Plan by Drake"* / *"תנגן נזכרה בי"* - and it plays.
+Say **"hey x"** (or press **F9**), say a song - *"play God's Plan by Drake"* / *"תנגן נזכרה בי"* - and it plays.
 
+- **"Hey x" wake word**, detected offline on your PC - nothing is sent anywhere until you say it.
+- **Purple overlay** ("Listening…") on top of borderless games: click-through, never takes focus.
 - **YouTube or Spotify**, picked with the toggle in the window.
-- **Spoken confirmation** in a natural female voice: *"Gotchu, God's Plan is now playing on YouTube."* (English or Hebrew).
+- **Spoken confirmation** in a natural female voice: *"Gotchu, God's Plan is now playing on YouTube."* / *"סגור, God's Plan מתנגן עכשיו ביוטיוב."*
 - **Never steals focus**: the song window opens on your second monitor, focus goes straight back to your game.
 - **Song-only volume** bar and voice commands - never touches the Windows master volume.
 - **Auto-close**: the YouTube song window closes itself when the song really ends.
@@ -41,17 +43,19 @@ Then open **⚙ Settings** to pick your microphone and run **Mic check**, and us
 
 ## How it works (short)
 
+- **Wake word** → offline Vosk model listening only for "hey x" (~0.1% CPU).
 - **Speech** → Google speech recognition (English / Hebrew).
 - **YouTube** → a dedicated Chrome window controlled over the local DevTools protocol (same tab, volume, loop, end-of-song detection), placed on the secondary monitor without activation.
 - **Spotify** → Spotify Free can't be started via the Web API, so the desktop app is driven through Windows UI Automation (accessibility interface); Premium + API keys are used when available.
-- **Voice** → ElevenLabs if a key is set, otherwise Microsoft's neural *Emma Multilingual* voice.
+- **Voice** → ElevenLabs if a key is set, otherwise Google's voice, with the built-in Windows voice as an offline fallback.
 
 ## Build from source
 
 ```bash
 python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\pyinstaller --onefile --noconsole --name XAssistant --icon icon.ico --add-data "icon.ico;." --hidden-import websocket --hidden-import pycaw.pycaw --hidden-import comtypes.stream --collect-submodules comtypes --collect-all uiautomation --collect-all edge_tts --collect-data certifi --hidden-import psutil x_assistant.py
+.venv\Scripts\python -m pip install -r requirements.txt
+:: download vosk-model-small-en-us-0.15 from https://alphacephei.com/vosk/models and unzip it into models\
+.venv\Scripts\python -m PyInstaller --onefile --noconsole --name XAssistant --icon icon.ico --add-data "icon.ico;." --add-data "models;models" --collect-all vosk --hidden-import websocket --hidden-import pycaw.pycaw --hidden-import comtypes.stream --collect-submodules comtypes --collect-all uiautomation --collect-all edge_tts --collect-data certifi --hidden-import psutil x_assistant.py
 ```
 
 Windows 10/11 only (Windows 11 for rounded corners).

@@ -66,6 +66,8 @@ DEFAULT_CONFIG = {
     "spotify_client_id": "",
     "spotify_client_secret": "",
     "spotify_redirect_uri": "http://127.0.0.1:8888/callback",
+    "wake_word": True,                # say "hey x" instead of pressing the hotkey (offline detection)
+    "overlay": True,                  # small purple "Listening…" pill on top of games
     "voice_confirmation": True,       # say "Gotchu, <song> is now playing on <platform>."
     "elevenlabs_api_key": "",         # optional: most natural voice
     "elevenlabs_voice_id": "",        # empty = pick the most natural conversational female voice automatically
@@ -1211,7 +1213,7 @@ def confirmation_text(language, title, platform):
     lang = "he" if language.startswith("he") else "en"
     where = PLATFORM_SPOKEN[lang][platform]
     if lang == "he":
-        return f"גוטצ׳ה, {title} מתנגן עכשיו {where}."
+        return f"סגור, {title} מתנגן עכשיו {where}."  # "גוטצ׳ה" came out as "gotacha"
     return f"Gotchu, {title} is now playing {where}."
 
 
@@ -1262,10 +1264,49 @@ class Speaker:
                 return self._elevenlabs(text, path, cfg, language)
             except Exception as e:  # bad key / quota / offline: fall back to the neural voice
                 log_exception(type(e), e, e.__traceback__)
-        import asyncio
-        import edge_tts
-        voice = cfg.get("tts_voice") or "en-US-EmmaMultilingualNeural"
-        asyncio.run(edge_tts.Communicate(text, voice, rate="-4%").save(path))
+        if not Speaker._edge_blocked:
+            try:
+                import asyncio
+                import edge_tts
+                voice = cfg.get("tts_voice") or "en-US-EmmaMultilingualNeural"
+                asyncio.run(edge_tts.Communicate(text, voice, rate="-4%").save(path))
+                return True
+            except Exception as e:  # Microsoft started refusing this service (403): skip it for this session
+                Speaker._edge_blocked = True
+                log_activity(f"  voice: Microsoft neural voice unavailable ({type(e).__name__}), using Google voice")
+        try:
+            return self._google(text, path, language)
+        except Exception as e:
+            log_exception(type(e), e, e.__traceback__)
+        return self._windows_voice(text, path, language)
+
+    _edge_blocked = False
+
+    @staticmethod
+    def _google(text, path, language):
+        """Google's free TTS voice (female, English + Hebrew)."""
+        lang = "iw" if language.startswith("he") else "en"
+        url = ("https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=" + lang
+               + "&q=" + urllib.parse.quote(text[:200]))
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=8) as r:
+            data = r.read()
+        if len(data) < 1000:
+            raise ValueError("empty TTS response")
+        with open(path, "wb") as f:
+            f.write(data)
+        return True
+
+    @staticmethod
+    def _windows_voice(text, path, language):
+        """Offline last resort: the voice built into Windows (always works, sounds robotic)."""
+        import comtypes.client
+        voice = comtypes.client.CreateObject("SAPI.SpVoice")
+        stream = comtypes.client.CreateObject("SAPI.SpFileStream")
+        stream.Open(path, 3)  # SSFMCreateForWrite (WAV data; MCI plays it regardless of the file name)
+        voice.AudioOutputStream = stream
+        voice.Speak(text)
+        stream.Close()
+        return True
         return True
 
     def _elevenlabs(self, text, path, cfg, language):
@@ -1316,6 +1357,164 @@ class Speaker:
             mci(f"play {alias} wait", None, 0, None)
         finally:
             mci(f"close {alias}", None, 0, None)
+
+
+# ---------------------------------------------------------------- "hey x" wake word (offline)
+
+WAKE_MODEL = os.path.join(RES_DIR, "models", "vosk-model-small-en-us-0.15")
+WAKE_GRAMMAR = json.dumps(["hey x", "hey ex", "hey [unk]", "[unk]"])
+
+
+class WakeListener:
+    """Listens for "hey x" with a small offline model (Vosk, ~0.1% CPU). Nothing leaves the PC until the wake
+    phrase is heard; then the last ~2 s of audio is handed to the normal recorder, so "hey x, play Starboy" can be
+    said in one breath, or "hey x" ... pause ... "play Starboy"."""
+
+    def __init__(self, app):
+        self.app = app
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            import vosk
+            vosk.SetLogLevel(-1)
+            model = vosk.Model(WAKE_MODEL)
+        except Exception as e:
+            log_exception(type(e), e, e.__traceback__)
+            return
+        while True:
+            cfg = self.app.cfg
+            if not cfg.get("wake_word", True) or self.app.busy:
+                time.sleep(0.3)
+                continue
+            mic = cfg["microphone"]
+            try:
+                with open_microphone(mic, "mme16") as src:
+                    rec = vosk.KaldiRecognizer(model, src.SAMPLE_RATE, WAKE_GRAMMAR)
+                    per_sec = src.SAMPLE_RATE / src.CHUNK
+                    history = collections.deque(maxlen=int(per_sec * 2.0))
+                    levels = collections.deque(maxlen=int(per_sec * 3.0))
+                    while cfg.get("wake_word", True) and not self.app.busy and self.app.cfg["microphone"] == mic:
+                        buf = src.read()
+                        history.append(buf)
+                        levels.append(audioop.rms(buf, 2))
+                        if rec.AcceptWaveform(buf):
+                            text = json.loads(rec.Result()).get("text", "")
+                        else:
+                            text = json.loads(rec.PartialResult()).get("partial", "")
+                        if text.startswith(("hey x", "hey ex")):
+                            ambient = sorted(levels)[len(levels) // 5]
+                            log_activity("wake word heard")
+                            self.app.events.put(("wake", list(history), src.SAMPLE_RATE, ambient))
+                            break
+                # give the main thread a moment to start recording before listening again
+                for _ in range(20):
+                    if self.app.busy:
+                        break
+                    time.sleep(0.05)
+            except Exception as e:
+                log_exception(type(e), e, e.__traceback__)
+                time.sleep(2)
+
+
+class Overlay:
+    """Small purple pill shown on top of everything (incl. borderless games) while X Assistant listens / works.
+    Click-through, never activated, not in the taskbar or Alt+Tab."""
+
+    W, H = 320, 62
+    KEY = "#9a53e6"  # transparent corners: a purple close to the pill's rim so the anti-aliased edge blends in
+
+    def __init__(self, root):
+        self.win = tk.Toplevel(root)
+        self.win.overrideredirect(True)
+        self.win.configure(bg=self.KEY)
+        self.win.attributes("-transparentcolor", self.KEY)
+        self.win.attributes("-topmost", True)
+        self.cv = tk.Canvas(self.win, width=self.W, height=self.H, bg=self.KEY, highlightthickness=0, bd=0)
+        self.cv.pack()
+        self.bg = ImageTk.PhotoImage(self._pill())
+        self.cv.create_image(0, 0, anchor="nw", image=self.bg)
+        self.icons = [ImageTk.PhotoImage(self._icon(g)) for g in (0.0, 0.35, 0.7, 1.0, 0.7, 0.35)]
+        self.icon = self.cv.create_image(31, self.H // 2, image=self.icons[0])
+        self.title = self.cv.create_text(62, 22, anchor="w", fill="white", font=(FONT, 11, "bold"))
+        self.sub = self.cv.create_text(62, 41, anchor="w", fill="#eadcff", font=(FONT, 8))
+        self.visible, self.frame, self.hide_job = False, 0, None
+        self.win.update_idletasks()
+        self.hwnd = ctypes.windll.user32.GetParent(self.win.winfo_id())
+        ex = ctypes.windll.user32.GetWindowLongW(self.hwnd, -20)
+        # click-through + never activated + no taskbar/Alt+Tab entry
+        ctypes.windll.user32.SetWindowLongW(self.hwnd, -20, ex | 0x20 | 0x08000000 | 0x80 | 0x80000)
+        primary = next((m["work"] for m in monitors() if m["primary"]), (0, 0, 0, 0))
+        self.win.geometry(f"{self.W}x{self.H}+{primary[0] + 24}+{primary[1] + 24}")
+        ctypes.windll.user32.ShowWindow(self.hwnd, 0)
+
+    def _pill(self, s=3):
+        W, H = self.W * s, self.H * s
+        grad = Image.linear_gradient("L").rotate(90).resize((W, H))
+        a, b = (112, 48, 220), (176, 64, 236)
+        img = Image.merge("RGB", [grad.point(lambda v, x=x, y=y: int(x + (y - x) * v / 255)) for x, y in zip(a, b)])
+        img = img.convert("RGBA")
+        sheen = Image.linear_gradient("L").resize((W, H)).point(lambda v: max(0, 70 - v * 70 // 110))
+        img = Image.alpha_composite(img, Image.merge("RGBA", (*[Image.new("L", (W, H), 255)] * 3, sheen)))
+        ImageDraw.Draw(img).rounded_rectangle((1, 1, W - 2, H - 2), H / 2, outline=(255, 255, 255, 110), width=s)
+        mask = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, W - 1, H - 1), H / 2, fill=255)
+        out = Image.new("RGBA", (W, H), self.KEY)
+        out.paste(img, (0, 0), mask)
+        return out.resize((self.W, self.H), Image.LANCZOS)
+
+    def _icon(self, glow, size=46, s=3):
+        S = size * s
+        img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        if glow:
+            g = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+            ImageDraw.Draw(g).ellipse((0, 0, S, S), fill=(255, 255, 255, int(90 * glow)))
+            img = Image.alpha_composite(img, g.filter(ImageFilter.GaussianBlur(3 * s)))
+        r = S * 0.36
+        c = S / 2
+        d = ImageDraw.Draw(img)
+        d.ellipse((c - r, c - r, c + r, c + r), fill=(255, 255, 255, 235))
+        w, lw, col = S * 0.12, max(2, int(S * 0.035)), (124, 58, 237)
+        d.rounded_rectangle((c - w / 2, c - S * 0.18, c + w / 2, c + S * 0.04), w / 2, fill=col)
+        a2 = S * 0.12
+        d.arc((c - a2, c - a2 - S * 0.03, c + a2, c + a2 - S * 0.03), 0, 180, fill=col, width=lw)
+        d.line((c, c + a2 - S * 0.03, c, c + S * 0.17), fill=col, width=lw)
+        return img.resize((size, size), Image.LANCZOS)
+
+    def show(self, title, sub="", hide_after=None):
+        self.cv.itemconfig(self.title, text=title)
+        self.cv.itemconfig(self.sub, text=sub if len(sub) <= 44 else sub[:43] + "…")
+        if self.hide_job:
+            self.win.after_cancel(self.hide_job)
+            self.hide_job = None
+        self.win.attributes("-alpha", 0.97)
+        if not self.visible:
+            ctypes.windll.user32.ShowWindow(self.hwnd, 4)  # SW_SHOWNOACTIVATE
+            self.visible = True
+        # stay above games that re-assert their own z-order: HWND_TOPMOST, no move/size/activate
+        ctypes.windll.user32.SetWindowPos(self.hwnd, -1, 0, 0, 0, 0, 0x1 | 0x2 | 0x10)
+        if hide_after:
+            self.hide_job = self.win.after(int(hide_after * 1000), self.hide)
+
+    def hide(self):
+        self.hide_job = None
+        if not self.visible:
+            return
+
+        def fade(alpha):
+            if alpha <= 0.05:
+                ctypes.windll.user32.ShowWindow(self.hwnd, 0)
+                self.visible = False
+                return
+            self.win.attributes("-alpha", alpha)
+            self.win.after(25, lambda: fade(alpha - 0.12))
+        fade(0.97)
+
+    def animate(self, active):
+        """Called from the app's tick: gentle pulse of the mic icon while listening."""
+        if self.visible and active:
+            self.frame = (self.frame + 1) % (len(self.icons) * 2)
+            self.cv.itemconfig(self.icon, image=self.icons[self.frame // 2])
 
 
 # ---------------------------------------------------------------- players
@@ -1487,6 +1686,7 @@ class App(Frameless):
         self.volume_jobs = queue.Queue()
         self.youtube = YouTubeWatcher(on_finished=self._song_finished, on_ready=self._song_ready)
         self.speaker = Speaker(self)
+        self.wake = None
         threading.Thread(target=self._volume_worker, daemon=True).start()
         self.events = queue.Queue()
         self.busy = False
@@ -1549,6 +1749,9 @@ class App(Frameless):
         self._build_platform_toggle()
         self._build_volume_slider()
         self.apply_config()
+        self.overlay = Overlay(self.root)
+        self.wake = WakeListener(self)
+        self._last_orb = None
         self.root.after(40, self.tick)
 
     # ---- where songs play: this toggle is the single source of truth (Settings shows the same choice)
@@ -1713,6 +1916,7 @@ class App(Frameless):
         return self.meter_cache[w]
 
     def set_state(self, state, status, detail="", reset_after=None):
+        self._update_overlay(state, status, detail)
         self.state = state
         self.cv.itemconfig(self.status, text=status)
         self.cv.itemconfig(self.detail, text=detail)
@@ -1721,15 +1925,30 @@ class App(Frameless):
         self.cv.itemconfig(self.meter_fill, state=listening)
         self.reset_at = time.time() + reset_after if reset_after else None
 
+    def _update_overlay(self, state, status, detail):
+        if not hasattr(self, "overlay") or not self.cfg.get("overlay", True):
+            return
+        if state == "listening":
+            self.overlay.show("Listening…", "Say a song (and artist)")
+        elif state == "thinking":
+            self.overlay.show(status, detail.strip("“”") if detail else "")
+        elif state in ("done", "error"):
+            self.overlay.show(status, detail, hide_after=3.0)
+        else:
+            self.overlay.hide()
+
     def idle_detail(self):
         app = "YouTube" if self.cfg["default_platform"] == "youtube" else "Spotify"
-        return f"Press {self.cfg['hotkey'].upper()} and say a song + artist (plays on {app})"
+        start = "Say “hey x” or press " if self.cfg.get("wake_word", True) else "Press "
+        return f"{start}{self.cfg['hotkey'].upper()}, then a song + artist (plays on {app})"
 
     def tick(self):
         while not self.events.empty():
             kind, *args = self.events.get()
             if kind == "trigger":
                 self.trigger()
+            elif kind == "wake":
+                self.trigger(wake=args)
             elif kind == "volume":
                 self.set_volume(*args)
             else:
@@ -1746,12 +1965,17 @@ class App(Frameless):
                 glow = max(glow // 2, min(7, int(self.shown_level * 9)))
         else:
             glow = 3
-        self.cv.itemconfig(self.orb, image=self.orb_frame(self.state, glow))
+        if (self.state, glow) != self._last_orb:  # only redraw when the frame actually changes
+            self._last_orb = (self.state, glow)
+            self.cv.itemconfig(self.orb, image=self.orb_frame(self.state, glow))
+        self.overlay.animate(self.state == "listening")
 
         self.shown_level = self.shown_level * 0.55 + self.level * 0.45
         if self.state == "listening":
             self.cv.itemconfig(self.meter_fill, image=self.meter_image(min(1.0, self.shown_level)))
-        self.root.after(40, self.tick)
+        # 25 fps only while something animates; idle ticks are slow (saves CPU while gaming)
+        active = pulses or self.state == "listening" or self.reset_at or not self.events.empty()
+        self.root.after(40 if active else 200, self.tick)
 
     # ---- config
 
@@ -1789,22 +2013,33 @@ class App(Frameless):
     def ui(self, *args):
         self.events.put(("state", *args))
 
-    def trigger(self):
+    def trigger(self, wake=None):
         if self.busy:
             return
         if self.cv.itemcget(self.type_win, "state") == "normal":
             self.toggle_typing(False)
         self.busy = True
         self.set_state("listening", "Listening…", "Say a song + artist, e.g. “God’s Plan by Drake”")
-        threading.Thread(target=self.listen_and_run, daemon=True).start()
+        threading.Thread(target=self.listen_and_run, args=(wake,), daemon=True).start()
 
-    def record(self, mic, start_timeout=8, max_seconds=12, end_silence=1.0):
-        """Record one phrase while publishing the live input level for the meter."""
+    def record(self, mic, start_timeout=8, max_seconds=12, end_silence=1.0, wake=None):
+        """Record one phrase while publishing the live input level for the meter.
+        `wake` = (frames, rate, ambient) from the wake-word listener: its audio (which holds "hey x" and maybe the
+        start of the command) is put in front, and its ambient level replaces calibration (the user may already be
+        talking)."""
         with mic as src:
             chunk, rate, width = src.CHUNK, src.SAMPLE_RATE, src.SAMPLE_WIDTH
             per_sec = rate / chunk
-            ambient = [audioop.rms(src.read(), width) for _ in range(max(1, int(per_sec * 0.35)))]
-            threshold = sum(ambient) / len(ambient) * 1.6 + 180
+            lead = b""
+            if wake:
+                wake_frames, wake_rate, wake_ambient = wake
+                lead = b"".join(wake_frames)
+                if wake_rate != rate:
+                    lead = audioop.ratecv(lead, width, 1, wake_rate, rate, None)[0]
+                threshold = wake_ambient * 1.6 + 180
+            else:
+                ambient = [audioop.rms(src.read(), width) for _ in range(max(1, int(per_sec * 0.35)))]
+                threshold = sum(ambient) / len(ambient) * 1.6 + 180
             scale = max(threshold * 3, 2500)
 
             preroll = collections.deque(maxlen=int(per_sec * 0.4))
@@ -1827,7 +2062,7 @@ class App(Frameless):
                 if quiet > per_sec * end_silence or heard > per_sec * max_seconds:
                     break
         self.level = 0.0
-        return sr.AudioData(b"".join(frames), rate, width)
+        return sr.AudioData(lead + b"".join(frames), rate, width)
 
     def toggle_typing(self, show=None):
         show = self.cv.itemcget(self.type_win, "state") == "hidden" if show is None else show
@@ -1940,9 +2175,9 @@ class App(Frameless):
             return
         self.ui("done", "Done ✓", msg, 8)
 
-    def listen_and_run(self):
+    def listen_and_run(self, wake=None):
         try:
-            audio = self.record(open_microphone(self.cfg["microphone"], self.cfg["capture_mode"]))
+            audio = self.record(open_microphone(self.cfg["microphone"], self.cfg["capture_mode"]), wake=wake)
             self.ui("thinking", "Thinking…", "")
             heard = recognize(audio, self.cfg["language"])
             self.ui("thinking", "Heard", f"“{heard}”")
