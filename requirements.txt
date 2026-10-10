@@ -1,0 +1,12 @@
+SpeechRecognition
+PyAudio
+keyboard
+spotipy
+Pillow
+websocket-client
+pycaw
+comtypes
+psutil
+uiautomation
+edge-tts
+pyinstaller

@@ -1,0 +1,20 @@
+# Private, per-PC data - never commit
+chrome_profile/
+config.json
+.spotify_token
+*.log
+*.log.old
+*.wav
+
+# Build output (the exe is published as a GitHub Release instead)
+XAssistant.exe
+build/
+dist/
+_new_build/
+*.spec
+*.tmp
+
+# Python
+.venv/
+__pycache__/
+*.pyc
