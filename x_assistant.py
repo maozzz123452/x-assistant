@@ -431,11 +431,22 @@ PLATFORM_RE = re.compile(
     r"\s+(?:(?:via|on|in|from|using|with|through|דרך)\s+)?ב?"
     r"(youtube|you tube|yt|y\.t\.?|y t|why tea|spotify|spot|יוטיוב|ספוטיפיי|ספוטיפי)\s*$", re.I)
 # filler words people say before the command ("please play…", "יאללה תנגן…")
+# how Google actually transcribed "hey x" (from the activity log): "acts play…", "ax play", "axe play…", "איי אקס…"
+MISHEARD_WAKE_RE = re.compile(
+    r"^\s*(?:(?:hey|hay|hi|he|a|ay|ok|okay|היי|איי|אי|הי)[\s,.!-]*)?"
+    r"(?:x|ex|eks|axe|ax|acts|aks|exe|איקס|אקס|אקסס|אקש)(?=[\s,.!?-]|$)[\s,.!?-]*", re.I)
+
+
+def strip_misheard_wake(text):
+    stripped = MISHEARD_WAKE_RE.sub("", text, count=1)
+    return stripped if stripped.strip() else text
+
+
 FILLER_RE = re.compile(
     r"^((please|hey|yo|ok|okay|can you|could you|would you|just|now|בבקשה|יאללה|אפשר|תוכל|תוכלי|רגע|אחי|אחותי|"
-    r"עכשיו|טוב|סבבה)[\s,.!]+)+", re.I)
+    r"עכשיו|טוב|סבבה|פליז)[\s,.!]+)+", re.I)
 PLAY_RE = re.compile(
-    r"^(put|play|start|open|תשים|תשימי|שים|שימי|תנגן|תנגני|נגן|נגני|תפעיל|תפעילי|הפעל|תשמיע|תשמיעי|השמע|"
+    r"^(put|play|start|open|פליי|תשים|תשימי|שים|שימי|תנגן|תנגני|נגן|נגני|תפעיל|תפעילי|הפעל|תשמיע|תשמיעי|השמע|"
     r"תעלה|תעלי)(?=[\s,.:!]|$)[\s,.:!]*(me\s+|לי[\s,]+)?(on\s+)?(the\s+|את\s+)?(song|track|music|השיר|שיר)?\s*",
     re.I)
 CONTROLS = {
@@ -1391,21 +1402,28 @@ class WakeListener:
             try:
                 with open_microphone(mic, "mme16") as src:
                     rec = vosk.KaldiRecognizer(model, src.SAMPLE_RATE, WAKE_GRAMMAR)
+                    rec.SetWords(True)          # word timings, so "hey x" can be cut out of the audio
+                    rec.SetPartialWords(True)
+                    fed = 0                     # samples fed so far (Vosk word times are relative to this stream)
                     per_sec = src.SAMPLE_RATE / src.CHUNK
                     history = collections.deque(maxlen=int(per_sec * 2.0))
                     levels = collections.deque(maxlen=int(per_sec * 3.0))
                     while cfg.get("wake_word", True) and not self.app.busy and self.app.cfg["microphone"] == mic:
                         buf = src.read()
                         history.append(buf)
+                        fed += len(buf) // 2
                         levels.append(audioop.rms(buf, 2))
                         if rec.AcceptWaveform(buf):
-                            text = json.loads(rec.Result()).get("text", "")
+                            result = json.loads(rec.Result())
+                            text, words = result.get("text", ""), result.get("result", [])
                         else:
-                            text = json.loads(rec.PartialResult()).get("partial", "")
+                            result = json.loads(rec.PartialResult())
+                            text, words = result.get("partial", ""), result.get("partial_result", [])
                         if text.startswith(("hey x", "hey ex")):
                             ambient = sorted(levels)[len(levels) // 5]
-                            log_activity("wake word heard")
-                            self.app.events.put(("wake", list(history), src.SAMPLE_RATE, ambient))
+                            lead, trimmed = _after_wake_trim(history, words, fed, src.SAMPLE_RATE)
+                            log_activity(f"wake word heard ({'cut out of the audio' if trimmed else 'not cut'})")
+                            self.app.events.put(("wake", [lead], src.SAMPLE_RATE, ambient, trimmed))
                             break
                 # give the main thread a moment to start recording before listening again
                 for _ in range(20):
@@ -1415,6 +1433,26 @@ class WakeListener:
             except Exception as e:
                 log_exception(type(e), e, e.__traceback__)
                 time.sleep(2)
+
+
+def _wake_end_sample(words, rate):
+    """Stream position (in samples) right after the "x" of "hey x", from Vosk's word timings."""
+    for i, w in enumerate(words[:-1]):
+        if w.get("word") == "hey" and words[i + 1].get("word") in ("x", "ex"):
+            return int((words[i + 1]["end"] + 0.03) * rate)
+    return None
+
+
+def _after_wake_trim(history, words, fed, rate):
+    """Keep only the audio *after* "hey x", so Google never hears the wake phrase (it used to transcribe it as
+    "acts", "ax", "axe", "איי אקס"... and that ended up inside the song name). Returns (pcm, trimmed)."""
+    pcm = b"".join(history)
+    end = _wake_end_sample(words, rate)
+    if end is None:
+        return pcm, False
+    start_of_history = fed - len(pcm) // 2
+    offset = max(0, end - start_of_history)
+    return pcm[offset * 2:], True
 
 
 class Overlay:
@@ -2032,7 +2070,7 @@ class App(Frameless):
             per_sec = rate / chunk
             lead = b""
             if wake:
-                wake_frames, wake_rate, wake_ambient = wake
+                wake_frames, wake_rate, wake_ambient = wake[:3]
                 lead = b"".join(wake_frames)
                 if wake_rate != rate:
                     lead = audioop.ratecv(lead, width, 1, wake_rate, rate, None)[0]
@@ -2180,6 +2218,8 @@ class App(Frameless):
             audio = self.record(open_microphone(self.cfg["microphone"], self.cfg["capture_mode"]), wake=wake)
             self.ui("thinking", "Thinking…", "")
             heard = recognize(audio, self.cfg["language"])
+            if wake and not (len(wake) > 3 and wake[3]):  # audio couldn't be cut: strip the wake phrase as text
+                heard = strip_misheard_wake(heard)
             self.ui("thinking", "Heard", f"“{heard}”")
             self.execute(heard)
         except sr.WaitTimeoutError:
